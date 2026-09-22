@@ -1,12 +1,17 @@
-const http = require("http");
+const { default: makeWASocket } = require("@whiskeysockets/baileys");
 
-const PORT = process.env.PORT || 3000;
+async function startBot() {
+  const sock = makeWASocket({
+    printQRInTerminal: true,
+  });
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
-  res.end("🚀 Seu projeto está rodando no Railway!");
-});
+  sock.ev.on("connection.update", (update) => {
+    const { connection } = update;
 
-server.listen(PORT, () => {
-  console.log(`Servidor rodando na porta ${PORT}`);
-});
+    if (connection === "open") {
+      console.log("✅ WhatsApp conectado!");
+    }
+  });
+}
+
+startBot();
