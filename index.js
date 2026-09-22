@@ -1,10 +1,12 @@
 const { default: makeWASocket, useMultiFileAuthState } = require("@whiskeysockets/baileys");
 const http = require("http");
+const url = require("url");
 const path = require("path");
 const fs = require("fs");
 const QRCode = require("qrcode");
 
 const PORT = process.env.PORT || 3000;
+const BAILEYS_API_KEY = process.env.BAILEYS_API_KEY || null;
 
 // Diretório para armazenar credenciais
 const authDir = path.join(__dirname, "baileys_auth");
@@ -12,10 +14,24 @@ const authDir = path.join(__dirname, "baileys_auth");
 // Variáveis globais
 let currentQRCode = null;
 let whatsappConnected = false;
+let socket = null;
+let messages = []; // Armazenar mensagens recebidas
 
 // Criar diretório se não existir
 if (!fs.existsSync(authDir)) {
   fs.mkdirSync(authDir, { recursive: true });
+}
+
+// Função para validar API Key
+function validateAPIKey(req) {
+  if (!BAILEYS_API_KEY) {
+    return false;
+  }
+  
+  const authHeader = req.headers.authorization || "";
+  const apiKeyFromHeader = authHeader.replace("Bearer ", "").trim();
+  
+  return apiKeyFromHeader === BAILEYS_API_KEY;
 }
 
 // Função para gerar QR Code em imagem Data URL
@@ -36,6 +52,12 @@ async function generateQRImage(text) {
     console.error("Erro ao gerar QR Code:", error.message);
     return null;
   }
+}
+
+// Função para enviar resposta JSON
+function sendJSON(res, statusCode, data) {
+  res.writeHead(statusCode, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(data, null, 2));
 }
 
 // Criar página HTML
@@ -203,9 +225,9 @@ const htmlPage = (qrImage, connected) => `
       ${connected ? '✅ WhatsApp Conectado' : '⏳ Aguardando Autenticação'}
     </div>
     
-    ${!connected ? `
-      <div class="qr-container ${!qrImage ? 'empty' : ''}">
-        ${qrImage ? `<img src="${qrImage}" alt="QR Code">` : '<p>Gerando QR Code...</p>'}
+    ${!connected ? \`
+      <div class="qr-container \${!qrImage ? 'empty' : ''}">
+        \${qrImage ? \`<img src="\${qrImage}" alt="QR Code">\` : '<p>Gerando QR Code...</p>'}
       </div>
       
       <div class="instruction">
@@ -220,14 +242,14 @@ const htmlPage = (qrImage, connected) => `
       </div>
       
       <button class="refresh-button" onclick="location.reload()">🔄 Atualizar QR Code</button>
-    ` : `
+    \` : \`
       <div style="padding: 40px; color: #28a745; font-size: 18px;">
         <p>Seu WhatsApp está conectado e pronto para usar! 🎉</p>
         <p style="font-size: 14px; color: #666; margin-top: 15px;">
           O bot está rodando e pode receber mensagens.
         </p>
       </div>
-    `}
+    \`}
     
     <div class="footer">
       Bússola para Afiliados © 2026
@@ -239,32 +261,236 @@ const htmlPage = (qrImage, connected) => `
 
 // Criar servidor HTTP
 const server = http.createServer(async (req, res) => {
-  // Rota para a página principal
-  if (req.url === "/" && req.method === "GET") {
+  const parsedUrl = url.parse(req.url, true);
+  const pathname = parsedUrl.pathname;
+  const query = parsedUrl.query;
+
+  // CORS headers
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  // Handle CORS preflight
+  if (req.method === "OPTIONS") {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+
+  // Rota: GET / - Página web com QR Code
+  if (pathname === "/" && req.method === "GET") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
     res.end(htmlPage(currentQRCode, whatsappConnected));
+    return;
   }
-  // Rota para status em JSON (opcional, para outros usos)
-  else if (req.url === "/status" && req.method === "GET") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(
-      JSON.stringify({
-        connected: whatsappConnected,
-        hasQR: currentQRCode !== null,
-      })
-    );
+
+  // Rota: GET /api/status - Status da conexão (sem autenticação para monitoramento)
+  if (pathname === "/api/status" && req.method === "GET") {
+    sendJSON(res, 200, {
+      connected: whatsappConnected,
+      hasQR: currentQRCode !== null,
+      qrCode: whatsappConnected ? null : currentQRCode,
+      timestamp: new Date().toISOString(),
+    });
+    return;
   }
-  // Outras requisições
-  else {
-    res.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
-    res.end("Página não encontrada");
+
+  // === ROTAS PROTEGIDAS POR API KEY ===
+  if (!validateAPIKey(req)) {
+    sendJSON(res, 401, {
+      error: "Unauthorized",
+      message: "API Key inválida ou não fornecida",
+      detail: "Envie a chave via header: Authorization: Bearer SUA_API_KEY",
+    });
+    return;
   }
+
+  // Rota: POST /api/messages/send - Enviar mensagem
+  if (pathname === "/api/messages/send" && req.method === "POST") {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk.toString();
+    });
+    req.on("end", async () => {
+      try {
+        const data = JSON.parse(body);
+        const { to, message } = data;
+
+        if (!to || !message) {
+          sendJSON(res, 400, {
+            error: "Bad Request",
+            message: "Campos 'to' (número) e 'message' (texto) são obrigatórios",
+          });
+          return;
+        }
+
+        if (!whatsappConnected || !socket) {
+          sendJSON(res, 503, {
+            error: "Service Unavailable",
+            message: "WhatsApp não está conectado",
+          });
+          return;
+        }
+
+        // Formatar número para WhatsApp (adicionar @s.whatsapp.net se necessário)
+        const jid = to.includes("@") ? to : `${to}@s.whatsapp.net`;
+
+        // Enviar mensagem
+        const result = await socket.sendMessage(jid, { text: message });
+
+        sendJSON(res, 200, {
+          success: true,
+          message: "Mensagem enviada com sucesso",
+          messageId: result.key.id,
+          to: to,
+          timestamp: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.error("Erro ao enviar mensagem:", error);
+        sendJSON(res, 500, {
+          error: "Internal Server Error",
+          message: error.message,
+        });
+      }
+    });
+    return;
+  }
+
+  // Rota: GET /api/messages - Listar mensagens recebidas
+  if (pathname === "/api/messages" && req.method === "GET") {
+    const limit = parseInt(query.limit) || 50;
+    const offset = parseInt(query.offset) || 0;
+    const from = query.from || null;
+
+    let filtered = messages;
+    if (from) {
+      filtered = messages.filter((m) => m.from === from);
+    }
+
+    const paginated = filtered.slice(offset, offset + limit);
+
+    sendJSON(res, 200, {
+      success: true,
+      total: filtered.length,
+      returned: paginated.length,
+      limit: limit,
+      offset: offset,
+      messages: paginated,
+    });
+    return;
+  }
+
+  // Rota: GET /api/chats - Listar conversas (contatos com histórico)
+  if (pathname === "/api/chats" && req.method === "GET") {
+    if (!whatsappConnected || !socket) {
+      sendJSON(res, 503, {
+        error: "Service Unavailable",
+        message: "WhatsApp não está conectado",
+      });
+      return;
+    }
+
+    try {
+      // Agrupar mensagens por contato
+      const chatMap = {};
+      messages.forEach((msg) => {
+        const key = msg.from || msg.to;
+        if (!chatMap[key]) {
+          chatMap[key] = {
+            jid: key,
+            name: msg.fromName || msg.toName || key,
+            lastMessage: msg.message,
+            lastMessageTime: msg.timestamp,
+            messageCount: 0,
+          };
+        }
+        chatMap[key].messageCount += 1;
+      });
+
+      const chats = Object.values(chatMap);
+
+      sendJSON(res, 200, {
+        success: true,
+        chatCount: chats.length,
+        chats: chats,
+      });
+    } catch (error) {
+      console.error("Erro ao listar chats:", error);
+      sendJSON(res, 500, {
+        error: "Internal Server Error",
+        message: error.message,
+      });
+    }
+    return;
+  }
+
+  // Rota: GET /api/session - Informações da sessão atual
+  if (pathname === "/api/session" && req.method === "GET") {
+    sendJSON(res, 200, {
+      success: true,
+      connected: whatsappConnected,
+      hasQR: currentQRCode !== null,
+      totalMessagesReceived: messages.length,
+      timestamp: new Date().toISOString(),
+    });
+    return;
+  }
+
+  // Rota: POST /api/disconnect - Desconectar WhatsApp
+  if (pathname === "/api/disconnect" && req.method === "POST") {
+    if (!whatsappConnected || !socket) {
+      sendJSON(res, 400, {
+        error: "Bad Request",
+        message: "WhatsApp já está desconectado",
+      });
+      return;
+    }
+
+    try {
+      socket.logout();
+      whatsappConnected = false;
+      currentQRCode = null;
+
+      sendJSON(res, 200, {
+        success: true,
+        message: "WhatsApp desconectado",
+      });
+    } catch (error) {
+      console.error("Erro ao desconectar:", error);
+      sendJSON(res, 500, {
+        error: "Internal Server Error",
+        message: error.message,
+      });
+    }
+    return;
+  }
+
+  // 404 - Rota não encontrada
+  sendJSON(res, 404, {
+    error: "Not Found",
+    message: "Rota não encontrada",
+    availableRoutes: {
+      public: ["GET /", "GET /api/status"],
+      protected: [
+        "POST /api/messages/send",
+        "GET /api/messages",
+        "GET /api/chats",
+        "GET /api/session",
+        "POST /api/disconnect",
+      ],
+    },
+  });
 });
 
 // Iniciar servidor HTTP
 server.listen(PORT, () => {
   console.log(`🌐 Servidor HTTP rodando na porta ${PORT}`);
   console.log(`📱 Acesse http://localhost:${PORT} para ver o QR Code`);
+  if (BAILEYS_API_KEY) {
+    console.log(`🔐 API Key configurada e ativa para operações`);
+  } else {
+    console.log(`⚠️  Aviso: BAILEYS_API_KEY não configurada. Endpoints protegidos não funcionarão.`);
+  }
 });
 
 // Função para iniciar o bot do WhatsApp
@@ -273,15 +499,15 @@ async function startBot() {
     // Usar persistência de autenticação
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
-    const sock = makeWASocket({
+    socket = makeWASocket({
       auth: state,
-      printQRInTerminal: true,
+      printQRInTerminal: false, // Desabilitar para usar na web
     });
 
     // Salvar credenciais quando atualizar
-    sock.ev.on("creds.update", saveCreds);
+    socket.ev.on("creds.update", saveCreds);
 
-    sock.ev.on("connection.update", async (update) => {
+    socket.ev.on("connection.update", async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
@@ -308,8 +534,22 @@ async function startBot() {
       }
     });
 
-    sock.ev.on("messages.upsert", async (m) => {
-      console.log("📨 Nova mensagem recebida de:", m.messages[0]?.key?.remoteJid);
+    // Listener para mensagens recebidas
+    socket.ev.on("messages.upsert", async (m) => {
+      const msg = m.messages[0];
+      if (!msg.key.fromMe) {
+        // Apenas mensagens recebidas
+        const messageData = {
+          id: msg.key.id,
+          from: msg.key.remoteJid,
+          fromName: msg.pushName || "Unknown",
+          message: msg.message?.conversation || msg.message?.extendedTextMessage?.text || "[Arquivo/Mídia]",
+          timestamp: new Date(msg.messageTimestamp * 1000).toISOString(),
+          type: msg.type || "message",
+        };
+        messages.push(messageData);
+        console.log("📨 Nova mensagem recebida de:", msg.key.remoteJid);
+      }
     });
   } catch (error) {
     console.error("❌ Erro ao iniciar bot:", error.message);
