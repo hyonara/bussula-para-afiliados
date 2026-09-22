@@ -6,6 +6,8 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "^6.7.5"
+    "@whiskeysockets/baileys": "^6.7.5",
+    "qrcode": "^1.5.3"
   }
 }
+
