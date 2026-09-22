@@ -1,0 +1,9 @@
+{
+  "name": "bussula-afiliados",
+  "version": "1.0.0",
+  "description": "Projeto simples",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  }
+}
